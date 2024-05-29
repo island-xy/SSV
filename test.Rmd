@@ -1,0 +1,621 @@
+---
+title: "SSV function"
+author: "YingXiang"
+date: "28/05/2024"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+```{r}
+library(readr)
+library(dplyr)
+library(BiocManager)
+library(pamr)
+library(preprocessCore)
+library(glmnet)
+library(randomForest)
+library(e1071)
+library(HiDimDA)
+library(ipred)
+library(vsn)
+library(MGSDA)
+library(xgboost)
+library(umap)
+library(data.table)
+library(Matrix)
+library(lightgbm)
+library(limma)
+library(reshape)
+library(ggplot2)
+library(grid)
+library(caret)
+library(readxl)
+```
+
+
+```{r loading data}
+#loading dataset including both training and validation sets
+#row: features
+#column: samples
+data <- read.table("tmp4.txt")
+training_validation <- data.frame(data[32:2597,])
+colnames(training_validation) <- training_validation[1,]
+rownames(training_validation) <- training_validation[,1]
+training_validation <- (training_validation[-1,-1])
+training_validation <- training_validation%>% mutate_all(as.numeric)
+
+meta_data <- data.frame(t(data[1:32,]))
+rownames(meta_data) <- meta_data[,32]
+meta_data <- meta_data[,-c(11,20)]
+colnames(meta_data) <- meta_data[1,]
+meta_data <- meta_data[-1,]
+
+#loading class of each samples
+#rowname: sample id
+#column: class
+class_id <- data.frame(class=factor(meta_data$`!Sample_description`))
+
+#Scenario1: ovarian cancer vs. non-cancer
+training_validation_1 <- training_validation[,unlist(class_id)%in%c("non-Cancer","Ovarian Cancer")]
+class_id_1 <- data.frame(class=factor(class_id[unlist(class_id)%in%c("non-Cancer","Ovarian Cancer"),]))
+
+```
+
+
+#if there isn't batch information, use poor marker to identify batch
+```{r}
+set.seed(12345)
+data1=training_validation_1
+means=apply(data1,1,mean,na.rm=TRUE)
+names(means)<-rownames(data1)
+hist(means,breaks=200)
+#determine the lower and upper boundary of poor marker
+lower=4
+upper=4.5
+abline(v=lower,col="blue")
+abline(v=upper,col="blue")
+#generally, there should be about 100 poor marker
+
+
+#check the sample size of poor and good marker
+sum(means<upper&means>lower)
+sum(means>8)
+
+poordata=data1[which(means<upper&means>lower),]
+positive_data=data1[which(means>8),]
+
+uhdata_averaged.umap = umap(t(poordata), n_components = 4) 
+layout <- uhdata_averaged.umap[["layout"]] 
+layout <- data.frame(layout) 
+layout$cancer_type <- class_id_1[,1]
+
+######
+layout%>%ggplot(aes(x=X1,y=X2,color=cancer_type))+geom_point()+
+  theme(plot.title = element_text(hjust = 0.5,size=16),axis.title=element_text(size=12))+labs(title="") + labs(y= "UMAP2", x = "UMAP1")+
+  geom_hline(aes(yintercept=0.2))
+```
+
+#split batch
+```{r}
+layout$batch <- ifelse(layout$X2< 0.2,1,2)
+batch <- ifelse(layout$X2< 0.2,1,2)
+```
+
+```{r frozne qn}
+quant.norm<-function(data = NULL,train = NULL, test = NULL, ref.dis = NULL){
+  train <- as.matrix(data[,train])
+  test <- as.matrix(data[,test])
+  if(!is.null(train) && !is.null(test)) stopifnot(nrow(train) == nrow(test))
+  if(is.null(train)) stopifnot(!is.null(ref.dis))
+  
+  if(!is.null(train)){
+    # quantile normalization training
+    train.qn <- preprocessCore::normalize.quantiles(train, copy = TRUE)
+    dimnames(train.qn) <- dimnames(train)
+    
+    ref.dis <- as.numeric(sort(train.qn[, 1]))
+  } else train.qn <- NULL
+  
+  if(is.null(test)){
+    test.fqn <- NULL
+  } else{
+    ## frozen quantile normalize test
+    test.fqn <- apply(test, 2, function(x){ord <- rank(x); ref.dis[ord]})
+    dimnames(test.fqn) <- dimnames(test)
+  }
+  
+  return(list("train.qn" = train.qn,
+              "test.fqn" = test.fqn,
+              "ref.dis" = ref.dis))
+}
+```
+
+```{r med norm}
+"med.norm" <- function(data = NULL,train = NULL, test = NULL, ref.dis = NULL){
+  train <- as.matrix(data[,train])
+  test <- as.matrix(data[,test])
+  if(!is.null(train) && !is.null(test)) stopifnot(nrow(train) == nrow(test))
+  if(is.null(train)) stopifnot(!is.null(ref.dis))
+  
+  if(!is.null(train)){
+    # median normalization training
+    ref.dis <- median(train)
+    temp <- apply(train, 2, median) - ref.dis
+    shifts.train <- matrix(rep(temp, each = nrow(train)), ncol = ncol(train))
+    train.mn <- train - shifts.train
+  } else train.mn <- NULL
+  
+  if(is.null(test)) {
+    test.fmn <- NULL
+  } else{
+    temp <- apply(test, 2, median) - ref.dis
+    shifts.test <- matrix(rep(temp, each = nrow(test)), ncol = ncol(test))
+    test.fmn <- test - shifts.test
+  }
+  
+  return(list("train.mn" = train.mn,
+              "test.fmn" = test.fmn,
+              "ref.dis" = ref.dis))
+}
+```
+
+```{r vs norm}
+"vs.norm" <- function(data = NULL,train = NULL, test = NULL, ref.dis = NULL){
+  train <- as.matrix(data[,train])
+  test <- as.matrix(data[,test])
+  if(!is.null(train) && !is.null(test)) stopifnot(nrow(train) == nrow(test))
+  if(is.null(train)) stopifnot(!is.null(ref.dis))
+  
+  if(!is.null(train)){
+    # vsn training
+    train0 <- 2^train
+    ref.dis <- vsn::vsn2(train0)
+    train.vsn <- log2(exp(as.matrix(ref.dis)))
+  } else train.vsn <- NULL
+  
+  if(is.null(test)) {
+    test.fvsn <- NULL
+  } else {
+    test0 <- 2^test
+    test.fvsn0 <- vsn::vsn2(test0, ref.dis)
+    test.fvsn <- log2(exp(as.matrix(test.fvsn0)))
+  }
+  
+  return(list("train.vsn" = train.vsn,
+              "test.fvsn" = test.fvsn,
+              "ref.dis" = ref.dis))
+}
+```
+
+```{r ml function}
+#ml function
+
+#pam
+"pam.intcv" <- function(X, y, vt.k = NULL, n.k = 30, kfold = 5, folds = NULL, seed){
+  
+  ptm <- proc.time()
+  set.seed(seed)
+  data.pam  <- list(x = X, y = factor(y), geneids = rownames(X), genenames = rownames(X))
+  fit.pam	<- pamr::pamr.train(data.pam, threshold=vt.k, n.threshold = n.k)
+  fit.cv <-  new.pamr.cv(fit = fit.pam, data = data.pam, nfold = kfold)
+  best.threshold <- fit.cv$threshold[max(which(fit.cv$error == min(fit.cv$error)))]
+  
+  mc <- fit.cv$error[which.min(fit.cv$error)]
+  
+  model <- pamr::pamr.train(data.pam, threshold = best.threshold, n.threshold = n.k)
+  
+  ## if nonzero == 0 (no feature selected)
+  coefs <- trycatch.func(pamr::pamr.listgenes(model, data.pam, threshold = best.threshold))
+  
+  time <- proc.time() - ptm
+  return(list(mc = mc, time = time, model = model, cfs = coefs))
+}
+"new.pamr.cv" <- function (fit, data, nfold = 5, ...){
+  x <- data$x[fit$gene.subset, fit$sample.subset]
+  if (is.null(fit$newy)) {
+    y <- factor(data$y[fit$sample.subset])
+  }
+  else {
+    y <- factor(data$newy[fit$sample.subset])
+  }
+  this.call <- match.call()
+  nsccv2 <- get("nsccv", envir = asNamespace("pamr"))
+  balanced.folds <- get("balanced.folds", envir = asNamespace("pamr"))
+  folds = balanced.folds(y, nfolds = nfold)
+  junk <- nsccv2(x, y, object = fit, folds = folds,
+                 survival.time = data$survival.time,
+                 censoring.status = data$censoring.status,
+                 ngroup.survival = fit$ngroup.survival,
+                 problem.type = fit$problem.type,
+                 ...) # changed here
+  junk$call <- this.call
+  junk$newy <- fit$newy
+  junk$sample.subset <- fit$sample.subset
+  return(junk)
+}
+"trycatch.func" <- function(expr, msg = "") {
+  out <- tryCatch({
+    expr
+    
+  }, warning = function(cond) {
+    message("warning: ")
+    message(cond)
+    # Choose a return value in case of warning
+    return(NULL)
+    
+  }, error = function(cond) {
+    message("error: ")
+    message(cond)
+    # Choose a return value in case of error
+    return(NA)
+    
+  }, finally={
+    message(msg)
+    
+  })
+  return(out)
+}
+"pam.predict" <- function(pam.intcv.model, pred.obj, pred.obj.group.id){
+  pred <- pamr::pamr.predict(pam.intcv.model$model, newx = pred.obj,
+                             threshold = pam.intcv.model$model$threshold,
+                             type = "class")
+  
+  mc <- tabulate.ext.err.func(pred, pred.obj.group.id)
+  prob <- pamr::pamr.predict(pam.intcv.model$model, newx = pred.obj,
+                             threshold = pam.intcv.model$model$threshold,
+                             type = "posterior")
+  return(list(pred=pred, mc=mc, prob=prob))
+}
+
+#svm
+"svm.intcv" <- function(kfold = 5, X, y, seed){
+  ptm <- proc.time()
+  set.seed(seed)
+  
+  svm_tune = tune.svm(x = data.matrix((X)), y = factor(y), tunecontrol = tune.control(cross = kfold))
+  
+  time <- proc.time() - ptm
+  return(list(mc = svm_tune$best.performance, time = time, model = svm_tune$best.model))
+}
+
+"svm.predict" <- function(svm.intcv.model, pred.obj, pred.obj.group.id){
+  
+  pred <- predict(svm.intcv.model$model, newdata = t(pred.obj))
+  mc <- tabulate.ext.err.func(pred, pred.obj.group.id)
+  
+  return(list(pred=pred, mc=mc))
+}
+#lasso
+lasso.intcv<-function(kfold = 5, X, y, seed, alp = 1){
+  ptm <- proc.time()
+  set.seed(seed)
+  
+  cv.fit <- glmnet::cv.glmnet(x = data.matrix(t(X)), y = factor(y),
+                              family = "binomial", type.measure = "class", alpha = alp, nfold = kfold)
+  mc <- cv.fit$cvm[which(cv.fit$lambda == cv.fit$lambda.1se)]
+  #best.lambda <- cv.fit$lambda.1se # can be extracted from cv.fit
+  coefs <- trycatch.func(coef(cv.fit, s = "lambda.1se"))
+  time <- proc.time() - ptm
+  return(list(mc=mc, time=time, model=cv.fit, cfs=coefs))
+}
+lasso.predict<-function(lasso.intcv.model, pred.obj, pred.obj.group.id){
+  pred <- predict(lasso.intcv.model$model, newx = t(pred.obj),
+                  s = lasso.intcv.model$model$lambda.1se,
+                  type = "class")
+  
+  mc <- tabulate.ext.err.func(pred, pred.obj.group.id)
+  prob <- predict(lasso.intcv.model$model, newx = t(pred.obj),
+                  s = lasso.intcv.model$model$lambda.1se)
+  return(list(pred=pred, mc=mc, prob=prob))
+}
+
+#xgboost
+cvxgb<-function(datacv,fold){
+  #tune parameters for eta 
+  minerror=Inf
+  
+  #for (alphavalue in seq(0,5,1)){
+  ##################
+  for (min_child_weightvalue in seq(1,9,4)){
+
+
+        
+        param <- list(min_child_weight=min_child_weightvalue)
+        
+        cvout<-xgb.cv(data=datacv,nrounds=100,nfold=fold,params = param,metrics=list('error'),maximize = F,objective = "binary:logistic",verbose=FALSE,early_stopping_rounds = 20)
+        if (min(cvout[[4]]$test_error_mean)<minerror){
+          minerror=min(cvout[[4]]$test_error_mean)
+          best_param = param
+          
+          index = which.min(cvout[[4]]$test_error_mean)
+        }
+      
+    
+  }
+  
+  #tune parameters for 
+  return(list(param=best_param,nround=index,cverror=minerror))
+}
+"xgboost.intcv" <- function(kfold = 5, X, y, seed){
+  ptm <- proc.time()
+  set.seed(seed)
+  id = y
+  dtrain <- xgb.DMatrix(data = t(X), label = id)
+  cvresult<-cvxgb(datacv=dtrain,fold=kfold)
+  bestparam=cvresult$param
+  print('best param is')
+  print(bestparam)
+  nround=cvresult$nround
+  trainresult<-xgboost(data=dtrain,nrounds=nround,params=bestparam,eval_metric='error',objective = "binary:logistic")
+  
+  time <- proc.time() - ptm
+  
+  return(list(mc = cvresult$cverror, time = time, model = trainresult))
+}
+
+
+"xgboost.predict" <- function(xgboost.intcv.model, pred.obj, pred.obj.group.id){
+  
+  pred <- predict(xgboost.intcv.model$model, t(pred.obj))
+  prediction <- as.numeric(pred > 0.5)
+  pred_class <- ifelse(prediction == "0", "E", "V")
+  mc <- tabulate.ext.err.func(pred_class, pred.obj.group.id)
+  
+  return(list(pred=pred_class, mc=mc))
+}
+
+#knn
+"knn.intcv" <- function(kfold = 5, X, y, seed){
+  ptm <- proc.time()
+  set.seed(seed)
+  
+  
+  ctrl <- trainControl(method = "repeatedcv",
+                       repeats = 3,
+                       number = kfold)
+  knn <- train(x = data.matrix(t(X)), y = factor(y),
+               method = "knn",
+               tuneLength = 9,
+               trControl = ctrl)
+  
+  time <- proc.time() - ptm
+  return(list(mc = 1 - max(knn$results$Accuracy), time = time, model = knn, cfs = NULL))
+}
+
+"knn.predict" <- function(knn.intcv.model, pred.obj, pred.obj.group.id){
+  
+  
+  pred <- predict(knn.intcv.model$model, newdata = data.matrix(t(pred.obj)))
+  mc <- tabulate.ext.err.func(pred, pred.obj.group.id)
+  
+  return(list(pred=pred, mc=mc))
+}
+
+#random forest
+"ranfor.intcv" <- function(kfold = 5, X, y, seed){
+  ptm <- proc.time()
+  set.seed(seed)
+  
+  
+  control <- trainControl(method='cv', 
+                          number=5, 
+                          search = 'random')
+  
+  rf <- train(x = data.matrix(t(X)), y = factor(y),
+              method = 'rf',
+              metric = 'Accuracy',
+              tuneLength = 5,
+              preProcess = c("center", "scale"),
+              trControl = control)
+  
+  
+
+  time <- proc.time() - ptm
+  return(list(mc = 1 - max(rf$results$Accuracy), time = time, model = rf, cfs = NULL))
+}
+
+"ranfor.predict" <- function(ranfor.intcv.model, pred.obj, pred.obj.group.id){
+  
+  pred <- predict(ranfor.intcv.model$model, newdata = t(pred.obj))
+  mc <- tabulate.ext.err.func(pred, pred.obj.group.id)
+  
+  return(list(pred=pred, mc=mc))
+}
+
+"tabulate.ext.err.func" <- function(pred.obj, obs.grp){
+  return(1 - sum(diag(table(pred.obj, obs.grp)))/length(obs.grp))
+  }
+```
+
+
+```{r}
+#n: times of ml
+#data: dataframe (row:features, col:samples)
+#class: a vector contain class id (factor)
+#batch: a vector contain batch id
+#batch_time: Whether to divide batches by time
+#if batch_time is not F, plug in the early batch id
+#ml: ml methods
+#split_comination: a vector containing number meaning splitting strategy
+#e.g.: c(50,70,80,90,100)
+#file: prefix of the result file name
+
+#make sure that the colnames of data is the same as the names of batch
+ml_sum = function (n=times,
+                   data,
+                   class,
+                   batch,
+                   batch_time=F,
+                   early_batch_id,
+                   ml="knn",
+                   split_comination,
+                   file){
+dim1=as.character(split_comination)
+dim2=c("non","qn","mn","vsn")
+dim3=as.character(seq(1,n))
+for (ml_method in ml){
+  eval(parse(text = paste0(ml_method,"_result=array(NA,dim=c(length(dim1),length(dim2),length(dim3)),dimnames=list(dim1,dim2,dim3))")))
+}
+class=unlist(class)
+for (k in 1:n){
+  set.seed(k+2024)
+  unique_batch <- unique(batch)
+  if(batch_time==F){
+    unique_batch1=sample(unique_batch,length(unique_batch)/2)
+    unique_batch2=unique_batch[!unique_batch%in%unique_batch1]
+    batch1=which(batch%in%unique_batch1)
+    batch2=which(batch%in%unique_batch2)
+  }
+  if(batch_time!=F){
+    unique_batch_early=early_batch_id
+    unique_batch_late=unique_batch[!unique_batch%in%unique_batch_early]
+    batch1=which(batch%in%unique_batch_early)
+    batch2=which(batch%in%unique_batch_late)
+  }
+for (split in split_comination){
+    i=which(split==split_comination)
+    train_2=sample(batch2,length(batch2)*(100-split)/100)
+    train_1=sample(batch1,length(batch1)*split/100)
+    train_id=sort(c(train_2,train_1))
+    
+    test_2=batch2[(!(batch2 %in% train_2))]
+    test_1=batch1[(!(batch1 %in% train_1))]
+    test_id=sort(c(test_2,test_1))
+  
+    train_label=class[train_id]
+    test_label=class[test_id]
+for (norm in c("non","qn","mn","vsn")){
+      if (norm=="non"){
+        j=1
+        test=data[,test_id]
+        train=data[,train_id]
+      }
+      if (norm=="qn"){
+        j=2
+        qn_result=quant.norm(data,train_id,test_id)
+        test=qn_result$test.fqn
+        train=qn_result$train.qn
+      }
+      if (norm=="mn"){
+        j=3
+        mn_result=med.norm(data,train_id,test_id)
+        test=mn_result$test.fmn
+        train=mn_result$train.mn
+      }
+      if (norm=="vsn"){
+        j=4
+        vsn_result=vs.norm(data,train_id,test_id)
+        test=vsn_result$test.fvsn
+        train=vsn_result$train.vsn
+      }
+  for (ml_method in ml){
+    if (ml_method=="knn"){
+      knn.intcv.model=knn.intcv(kfold = 5, X=(train), y=train_label, seed=k)
+      pred.obj=(test)
+      pred.obj.group.id=test_label
+      pred <- predict(knn.intcv.model$model, newdata = data.matrix(t(pred.obj)))
+      error=mean(pred!=test_label)
+    }
+    if (ml_method=="lasso"){
+      lasso.intcv.model=lasso.intcv(X=(train), y=train_label, seed=k)
+      error=mean(predict(lasso.intcv.model$model, newx = t(test),s = lasso.intcv.model$model$lambda.1se,type = "class")!=test_label)
+      
+    }
+    if (ml_method=="pam"){
+      pam.intcv.model=pam.intcv(kfold = 5, X=(train), y=train_label, seed=k)
+      error=mean(pamr.predict(pam.intcv.model$model, newx = t(test),threshold = pam.intcv.model$model$threshold,type = "class")!=test_label)
+    }
+    if (ml_method=="rf"){
+      ranfor.intcv.model=ranfor.intcv(kfold = 5, X=(train), y=train_label, seed=k)
+      pred.obj=(test)
+      pred.obj.group.id=test_label
+      pred <- predict(ranfor.intcv.model$model, newdata = t(pred.obj))
+      error=mean(pred!=test_label)
+    }
+    if (ml_method=="svm"){
+      svm.intcv.model=svm.intcv(kfold = 5, X=t(train), y=train_label, seed=k)
+      pred.obj=(test)
+      pred.obj.group.id=test_label
+      error=mean(predict(svm.intcv.model$model, newdata = t(pred.obj))!=test_label)
+    }
+    if (ml_method=="xgb"){
+      xgboost.intcv.model=xgboost.intcv(X=(train), y=as.numeric(train_label)-1, seed=k)
+      pred <- predict(xgboost.intcv.model$model, t(test))
+      prediction <- as.numeric(pred > 0.5)
+      pred_class <- ifelse(prediction == "0", "non-Cancer", "Ovarian Cancer")
+      error=mean(pred_class!=test_label)
+    }
+      eval(parse(text = paste0(ml_method,"_result[i,j,k]=error")))
+  }
+  }
+}
+
+}
+for (ml_method in ml){
+  eval(parse(text = paste0("result<<-",ml_method,"_result")))
+  filename=paste(file,n,ml_method,"result.csv",sep="_")
+  write.table(result, file=filename, sep="\t", col.names = NA, quote=F)
+}
+}
+```
+
+
+```{r result plot}
+result_plot <- function(n,
+                        ml,
+                        file,
+                        split_comination){
+  error = vector("numeric")
+  se = vector("numeric")
+  for(i in ml){
+    filename=paste(file,n,i,"result.csv",sep="_")
+    eval(parse(text = paste0(i,"_result=read.csv('",filename,"',sep='\t')")))
+    eval(parse(text = paste0(i,"_result_non=rowMeans((",i,"_result[,-1])[,c(T,F,F,F)])")))
+    eval(parse(text = paste0(i,"_result_qn=rowMeans((",i,"_result[,-1])[,c(F,T,F,F)])")))
+    eval(parse(text = paste0(i,"_result_mn=rowMeans((",i,"_result[,-1])[,c(F,F,T,F)])")))
+    eval(parse(text = paste0(i,"_result_vsn=rowMeans((",i,"_result[,-1])[,c(F,F,F,T)])")))
+    
+    eval(parse(text = paste0(i,"_result_non_se=apply((",i,"_result[,-1])[,c(T,F,F,F)],1,sd)/10")))
+    eval(parse(text = paste0(i,"_result_qn_se=apply((",i,"_result[,-1])[,c(F,T,F,F)],1,sd)/10")))
+    eval(parse(text = paste0(i,"_result_mn_se=apply((",i,"_result[,-1])[,c(F,F,T,F)],1,sd)/10")))
+    eval(parse(text = paste0(i,"_result_vsn_se=apply((",i,"_result[,-1])[,c(F,F,F,T)],1,sd)/10")))
+    
+    eval(parse(text = paste0("error = c(error,",i,"_result_non,",i,"_result_qn,",i,"_result_mn,",i,"_result_vsn)")))
+    eval(parse(text = paste0("se = c(se,",i,"_result_non_se,",i,"_result_qn_se,",i,"_result_mn_se,",i,"_result_vsn_se)")))
+  }
+  strategy = factor(split_comination)
+  result_result = data.frame(error = error,
+                             se = se,
+                             ml = rep(ml,each=4*length(split_comination)),
+                             norm = rep(c("None","QN","MN","VSN"),each=length(split_comination),length(ml)),
+                             x=rep(1:length(split_comination),4*length(ml)))
+  p=ggplot(result_result,aes(x=x,y=error,color=ml,linetype=norm))+
+    geom_line()+
+    scale_x_continuous(breaks=1:length(split_comination),labels=split_comination)+
+    geom_errorbar(aes(ymin=error-se*1.96,ymax=error+se*1.96),width=0.1)+
+    labs(x = "")
+  print(p)
+}
+```
+
+
+```{r}
+times=20
+ml_sum(n=times,
+                   data=positive_data,
+                   class=class_id_1,
+                   batch=batch,
+                   batch_time=F,
+                   ml=c("knn","lasso","svm","xgb"),
+                   split_comination=c(50,70,80,90,100),
+                   file="yokoi")
+```
+
+
+```{r result plot}
+result_plot(n=times,
+                        ml=c("knn","lasso","svm","xgb"),
+                        file="yokoi",
+                        split_comination=c(50,70,80,90,100))
+```
